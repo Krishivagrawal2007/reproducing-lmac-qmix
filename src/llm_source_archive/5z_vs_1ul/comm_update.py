@@ -164,7 +164,7 @@ def communication(o):
 
     # -- 8. For each agent, collect messages from the other 4 agents (not self) --
     mask = (1 - th.eye(N, device=device, dtype=dtype)).unsqueeze(0).unsqueeze(-1)  # (1, N, N, 1)
-    msg_exp = msg.unsqueeze(1).expand(B, N, N, 22)  # (B, N, N, 22)
+    msg_exp = msg.unsqueeze(1).expand(B, N, N, -1)  # (B, N, N, 22)
     msg_masked = msg_exp * mask  # self-message is zeroed
 
     # For each receiver (agent axis=1), extract the messages from other 4 agents (axis=2)
