@@ -1,6 +1,5 @@
 nohup.out
 logs
-results
 data
 wandb
 3rdparty
@@ -265,3 +264,26 @@ $RECYCLE.BIN/
 *.lnk
 
 # End of https://www.gitignore.io/api/linux,python,windows,pycharm+all,visualstudiocode
+__MACOSX/
+wandb/
+logs/
+data/
+3rdparty/
+*.pkl
+wandb_key.txt
+
+# Track Sacred config.json and metrics.json for baseline plotting while ignoring
+# model checkpoints, console logs, and other Sacred runtime artifacts
+results/*
+!results/sacred/
+results/models/
+results/sacred/**
+!results/sacred/*/
+!results/sacred/*/*/
+!results/sacred/*/*/*/
+results/sacred/**/_sources/
+results/sacred/**/cout.txt
+results/sacred/**/info.json
+results/sacred/**/run.json
+!results/sacred/**/config.json
+!results/sacred/**/metrics.json

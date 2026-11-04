@@ -8,7 +8,7 @@
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
 #SBATCH --array=1-5
-#SBATCH --output=qmix_5z_job%A_seed%a.log
+#SBATCH --output=logs/5z_vs_1ul/qmix/qmix_5z_job%A_seed%a.log
 
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 

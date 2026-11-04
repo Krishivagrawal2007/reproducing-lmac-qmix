@@ -8,7 +8,7 @@
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
 #SBATCH --array=1-5
-#SBATCH --output=lmac_5z_job%A_seed%a.log
+#SBATCH --output=logs/5z_vs_1ul/lmac/lmac_5z_job%A_seed%a.log
 
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
@@ -19,8 +19,13 @@ cd ~/lmac_project
 export SC2PATH="$HOME/lmac_project/3rdparty/StarCraftII"
 export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 
-# Dynamically extract the important_state array for this specific map
-IMP_STATE=$(python -c "import re; match=re.search(r'\[.*?\]', open('src/llm_source_archive/5z_vs_1ul/imp_state_select.py').read().replace('\n','')); print(match.group(0)) if match else print('[]')")
+# Call select_important_state() directly (note: the earlier regex one-liner matched '[2]' in a docstring comment)
+IMP_STATE=$(python -c "
+import sys
+sys.path.insert(0, 'src/llm_source_archive/5z_vs_1ul')
+from imp_state_select import select_important_state
+print(select_important_state())
+")
 
 SEED=$SLURM_ARRAY_TASK_ID
 echo "Running LMAC on 5z_vs_1ul with seed $SEED using state $IMP_STATE"

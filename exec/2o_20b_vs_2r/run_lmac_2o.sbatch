@@ -8,7 +8,7 @@
 #SBATCH --mem=32G
 #SBATCH --time=48:00:00
 #SBATCH --array=1-5
-#SBATCH --output=/users/k25000843/lmac_project/logs/2o_20b_vs_2r/lmac/lmac_2o_job%A_seed%a.log
+#SBATCH --output=logs/2o_20b_vs_2r/lmac/lmac_2o_job%A_seed%a.log
 
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
@@ -27,7 +27,13 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 SEED=$SLURM_ARRAY_TASK_ID
 
-IMP_STATE=$(python -c "import re; match=re.search(r'\[.*?\]', open('src/llm_source_archive/2o_20b_vs_2r/imp_state_select.py').read().replace('\n','')); print(match.group(0)) if match else print('[]')")
+# Call select_important_state() directly (note: the earlier regex one-liner matched '[133]' in the docstring)
+IMP_STATE=$(python -c "
+import sys
+sys.path.insert(0, 'src/llm_source_archive/2o_20b_vs_2r')
+from imp_state_select import select_important_state
+print(select_important_state())
+")
 
 echo "Running LMAC on 2o_20b_vs_2r with seed $SEED using state $IMP_STATE"
 

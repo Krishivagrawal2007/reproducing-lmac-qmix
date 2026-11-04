@@ -8,7 +8,10 @@ from types import SimpleNamespace as SN
 import sys
 import importlib
 import torch as th
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 import pickle
 from controllers import REGISTRY as mac_REGISTRY
 from components.episode_buffer import ReplayBuffer

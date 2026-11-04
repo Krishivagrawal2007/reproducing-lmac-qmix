@@ -23,6 +23,20 @@ python plot_results.py --success-threshold 70
 # Point at a different results directory / output directory
 python plot_results.py --base-dir results/sacred --out-dir plots
 
+# Reproduce the final figures in plots/ (one per environment, seeds 1-5,
+# overwriting the previous figure instead of creating name_v2.png)
+python plot_results.py --seeds 1 2 3 4 5 --expected-seeds 1 2 3 4 5 --overwrite
+
+Metric selection
+----------------
+By default ("auto") every environment gets exactly ONE plot, using the first
+metric it logs from this priority list:
+    test_battle_won_mean    (SMAC: test win rate)
+    test_score_reward_mean  (Google Research Football: fraction of test
+                             episodes in which the team scored = win rate)
+    test_return_mean        (Level-Based Foraging: normalised test return)
+Pass --metrics to override this for all environments.
+
 Key fixes vs. the previous version
 -----------------------------------
 1. Smoothing bias: the old EMA started "warm" from the very first raw value,
@@ -40,6 +54,10 @@ Key fixes vs. the previous version
 5. Informativeness: per-config seed counts, detection of missing/duplicate
    seeds, min/max/mean/std of final performance, and (optionally) a simple
    pass/fail reproduction check against a target threshold.
+6. Resume stitching: sacred runs of one seed are applied in chronological
+   order and each continuation REPLACES everything from its first logged step
+   onwards (a resumed run restarts from an earlier checkpoint, so the old
+   run's points after that step belong to a discarded branch).
 """
 
 import argparse
@@ -58,6 +76,27 @@ sns.set_theme(style="whitegrid")
 
 DEFAULT_COLOR_MAP = {"LMAC": "#eb4c34", "QMIX": "#4c72b0"}
 FALLBACK_PALETTE = sns.color_palette("tab10")
+
+# "auto" metric mode: first metric an environment logs from this list is used,
+# so each environment produces exactly one plot.
+AUTO_METRIC_PRIORITY = ["test_battle_won_mean", "test_score_reward_mean", "test_return_mean"]
+
+# Metrics that are a per-episode success rate in [0, 1] and are shown as %.
+WIN_RATE_METRICS = ("battle_won", "score_reward")
+
+
+def is_win_rate_metric(metric_name):
+    m = metric_name.lower()
+    return any(k in m for k in WIN_RATE_METRICS)
+
+
+def metric_label(metric_name):
+    m = metric_name.lower()
+    if "battle_won" in m or "score_reward" in m:
+        return "Test Win Rate (%)"
+    if m == "test_return_mean":
+        return "Test Return Mean"
+    return metric_name.replace("_", " ").title()
 
 
 # --------------------------------------------------------------------------- #
@@ -122,7 +161,8 @@ def find_all_runs(base_dir, skip_log):
                 with open(config_path, "r") as f:
                     config = json.load(f)
                 alg_name = str(config.get("name", alg_fallback))
-                env_name = str(config.get("env_args", {}).get("map_name", env_fallback))
+                env_args = config.get("env_args", {}) or {}
+                env_name = str(env_args.get("map_name") or env_args.get("key") or env_fallback)
                 seed = str(config.get("seed", seed_fallback))
             except (json.JSONDecodeError, OSError) as e:
                 skip_log.append(f"[WARN] Could not parse config.json at {config_path}: {e} "
@@ -139,12 +179,25 @@ def find_all_runs(base_dir, skip_log):
             skip_log.append(f"[SKIP] Empty metrics.json at {metrics_path}")
             continue
 
+        # Chronological ordering key for stitching resumed runs: sacred's
+        # run.json start_time if available, else the numeric run id.
+        start_time = ""
+        run_json = os.path.join(root, "run.json")
+        if os.path.exists(run_json):
+            try:
+                with open(run_json, "r") as f:
+                    start_time = str(json.load(f).get("start_time") or "")
+            except (json.JSONDecodeError, OSError):
+                pass
+        run_id = int(seed_fallback) if str(seed_fallback).isdigit() else 0
+
         runs.append({
             "alg": alg_name.upper(),
             "env": env_name,
             "seed": seed,
             "run_dir": root,
             "metrics": metrics,
+            "order": (start_time, run_id),
         })
 
     return runs
@@ -153,15 +206,15 @@ def find_all_runs(base_dir, skip_log):
 # --------------------------------------------------------------------------- #
 # Filename versioning
 # --------------------------------------------------------------------------- #
-def versioned_path(directory, stem, ext=".png"):
+def versioned_path(directory, stem, ext=".png", overwrite=False):
     """
-    Return a path that never overwrites an existing file.
+    Return a path that never overwrites an existing file unless overwrite=True.
     First save: stem.png
     Next save (same stem already exists): stem_v2.png, stem_v3.png, ...
     The highest version number is always the most recent plot.
     """
     candidate = os.path.join(directory, f"{stem}{ext}")
-    if not os.path.exists(candidate):
+    if overwrite or not os.path.exists(candidate):
         return candidate
     v = 2
     while True:
@@ -179,17 +232,21 @@ def generate_plots(base_dir="results/sacred",
                     envs_filter=None,
                     algs_filter=None,
                     metrics_filter=None,
+                    seeds_filter=None,
                     smooth_weight=0.85,
                     expected_seeds=None,
                     success_threshold=None,
                     final_window=10,
-                    min_seeds=1):
+                    min_seeds=1,
+                    overwrite=False):
     """
-    envs_filter / algs_filter / metrics_filter: None = include everything,
-    otherwise a set of allowed (case-insensitive) names.
+    envs_filter / algs_filter / metrics_filter / seeds_filter: None = include
+    everything, otherwise a set of allowed (case-insensitive) names.
+    When metrics_filter is None ("auto"), each environment uses the first
+    metric it logs from AUTO_METRIC_PRIORITY so every environment gets one plot.
     expected_seeds: e.g. [1,2,3,4,5] — used to report missing seeds per config.
     success_threshold: if set, flags PASS/FAIL on the final metric value for
-    any metric containing "battle_won", per (env, alg).
+    any win-rate metric, per (env, alg).
     """
     skip_log = []
     all_runs = find_all_runs(base_dir, skip_log)
@@ -201,19 +258,20 @@ def generate_plots(base_dir="results/sacred",
         return
 
     def norm_set(x):
-        return {s.strip().upper() for s in x} if x else None
+        return {str(s).strip().upper() for s in x} if x else None
 
     envs_filter = norm_set(envs_filter)
     algs_filter = norm_set(algs_filter)
     metrics_filter = norm_set(metrics_filter)
+    seeds_filter = norm_set(seeds_filter)
 
-    default_metrics = {"TEST_BATTLE_WON_MEAN"}
-    target_metrics = metrics_filter if metrics_filter else default_metrics
+    auto_metrics = metrics_filter is None
+    candidate_metrics = {m.upper() for m in AUTO_METRIC_PRIORITY} if auto_metrics else metrics_filter
 
-    # env -> metric -> alg -> list of (seed, steps, values, run_dir)
+    # env -> metric -> alg -> list of (seed, steps, values, run_dir, order)
     data = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
 
-    filtered_out = {"env": 0, "alg": 0, "metric": 0}
+    filtered_out = {"env": 0, "alg": 0, "seed": 0, "metric": 0}
     for run in all_runs:
         env, alg, seed = run["env"], run["alg"], run["seed"]
 
@@ -223,10 +281,13 @@ def generate_plots(base_dir="results/sacred",
         if algs_filter and alg.upper() not in algs_filter:
             filtered_out["alg"] += 1
             continue
+        if seeds_filter and str(seed).upper() not in seeds_filter:
+            filtered_out["seed"] += 1
+            continue
 
         matched_any_metric = False
         for metric_name, metric_data in run["metrics"].items():
-            if metric_name.upper() not in target_metrics:
+            if metric_name.upper() not in candidate_metrics:
                 continue
             steps = np.array(metric_data.get("steps", []))
             values = np.array(metric_data.get("values", []))
@@ -234,49 +295,66 @@ def generate_plots(base_dir="results/sacred",
                 skip_log.append(f"[SKIP] {run['run_dir']}: metric '{metric_name}' "
                                  f"has mismatched/empty steps vs values, skipping this metric.")
                 continue
-            data[env][metric_name][alg].append((seed, steps, values, run["run_dir"]))
+            data[env][metric_name][alg].append(
+                (seed, steps, values, run["run_dir"], run.get("order", ("", 0)))
+            )
             matched_any_metric = True
 
         if not matched_any_metric:
             filtered_out["metric"] += 1
 
+    # In auto mode, keep only the highest-priority metric per environment so
+    # each environment produces one canonical plot.
+    if auto_metrics:
+        for env_name, metrics_dict in list(data.items()):
+            available_by_upper = {k.upper(): k for k in metrics_dict.keys()}
+            chosen = None
+            for prio in AUTO_METRIC_PRIORITY:
+                if prio.upper() in available_by_upper:
+                    chosen = available_by_upper[prio.upper()]
+                    break
+            if chosen is not None:
+                for k in list(metrics_dict.keys()):
+                    if k != chosen:
+                        del metrics_dict[k]
+
     # Stitch: a resumed/continued experiment creates a NEW sacred run each time
     # (results/sacred/.../<run_id>/metrics.json), and each one only contains the
-    # datapoints logged during THAT session — not the full history. So for a seed
-    # resumed multiple times, "most points in one run" is NOT the most complete
-    # curve; it's usually the *original* truncated run, since later continuation
-    # sessions each only add a handful of new points on top. The correct fix is
-    # to merge every sacred run for a given seed into one continuous series,
-    # keyed by step, rather than picking a single "best" run and discarding rest.
+    # datapoints logged during THAT session — not the full history. Apply partial
+    # runs in chronological order; each continuation replaces any earlier points
+    # at or after its starting step (which came from the previous run after the
+    # checkpoint that the continuation reloaded from).
     for env_name, metrics_dict in data.items():
         for metric_name, algs_dict in metrics_dict.items():
             for alg_name, runs in algs_dict.items():
                 seed_groups = defaultdict(list)
-                for seed, steps, values, run_dir in runs:
-                    seed_groups[seed].append((steps, values, run_dir))
+                for seed, steps, values, run_dir, order in runs:
+                    seed_groups[seed].append((steps, values, run_dir, order))
 
                 merged_runs = []
                 for seed, group in seed_groups.items():
                     if len(group) == 1:
-                        steps, values, run_dir = group[0]
+                        steps, values, run_dir, _order = group[0]
                         merged_runs.append((seed, steps, values, run_dir))
                         continue
 
-                    # Sort each partial run by its own starting step, so that when
-                    # two runs report the same step (e.g. the checkpoint step a
-                    # continuation resumed from), the later-chronological run's
-                    # value wins rather than being arbitrarily overwritten.
                     group_sorted = sorted(
-                        group, key=lambda g: g[0][0] if len(g[0]) else 0
+                        group,
+                        key=lambda g: (g[3], g[0][0] if len(g[0]) else 0),
                     )
                     merged = {}
-                    for steps, values, _run_dir in group_sorted:
+                    for steps, values, _run_dir, _order in group_sorted:
+                        if len(steps) == 0:
+                            continue
+                        first_step = steps[0]
+                        for old_s in [s for s in merged if s >= first_step]:
+                            del merged[old_s]
                         for s, v in zip(steps, values):
                             merged[s] = v
 
                     merged_steps = np.array(sorted(merged.keys()))
                     merged_values = np.array([merged[s] for s in merged_steps])
-                    run_dirs = ", ".join(rd for _s, _v, rd in group)
+                    run_dirs = ", ".join(rd for _s, _v, rd, _o in group_sorted)
                     merged_runs.append((seed, merged_steps, merged_values,
                                          f"merged({len(group)} runs)"))
                     skip_log.append(
@@ -293,15 +371,16 @@ def generate_plots(base_dir="results/sacred",
         print("[!] Filters excluded every run — nothing to plot.")
         print(f"    Excluded by env filter: {filtered_out['env']}, "
               f"by alg filter: {filtered_out['alg']}, "
+              f"by seed filter: {filtered_out['seed']}, "
               f"by metric filter/mismatch: {filtered_out['metric']}")
         return
 
     os.makedirs(out_dir, exist_ok=True)
 
-    print("=" * 100)
-    print(f"{'ENVIRONMENT':<18} | {'ALGORITHM':<8} | {'METRIC':<24} | {'SEEDS':<18} | "
-          f"{'FINAL (mean ± std)':<22} | {'RANGE (min–max)'}")
-    print("=" * 100)
+    print("=" * 110)
+    print(f"{'ENVIRONMENT':<38} | {'ALG':<6} | {'METRIC':<22} | {'SEEDS':<14} | "
+          f"{'FINAL (mean ± std)':<20} | {'RANGE (min–max)'}")
+    print("=" * 110)
 
     reproduction_report = []
 
@@ -361,7 +440,7 @@ def generate_plots(base_dir="results/sacred",
                 mean_values = np.mean(interpolated_values, axis=0)
                 std_values = np.std(interpolated_values, axis=0)
 
-                is_win_rate = "battle_won" in metric_name.lower()
+                is_win_rate = is_win_rate_metric(metric_name)
                 scale = 100.0 if (is_win_rate and np.max(mean_values) <= 1.0) else 1.0
 
                 mean_plot = mean_values * scale
@@ -373,8 +452,8 @@ def generate_plots(base_dir="results/sacred",
 
                 unit = "%" if is_win_rate else ""
                 seed_str = ",".join(sorted(seeds_used, key=lambda s: (len(s), s)))
-                print(f"{env_name:<18} | {alg_name:<8} | {metric_name:<24} | "
-                      f"{seed_str:<18} | {final_mean:6.2f} ± {final_std:4.2f}{unit:<3} "
+                print(f"{env_name:<38} | {alg_name:<6} | {metric_name:<22} | "
+                      f"{seed_str:<14} | {final_mean:6.2f} ± {final_std:4.2f}{unit:<3} "
                       f"| [{final_min:6.2f}, {final_max:6.2f}]{unit}  ({len(runs)} seeds)")
 
                 if success_threshold is not None and is_win_rate:
@@ -395,28 +474,28 @@ def generate_plots(base_dir="results/sacred",
                 has_plotted = True
 
             if has_plotted:
-                y_label = "Test Win Rate (%)" if "battle_won" in metric_name.lower() \
-                    else metric_name.replace("_", " ").title()
+                y_label = metric_label(metric_name)
                 plt.title(f"{env_name} — {y_label}", fontsize=14, fontweight="bold", pad=12)
                 plt.xlabel("Environment Timesteps", fontsize=12)
                 plt.ylabel(y_label, fontsize=12)
-                if "battle_won" in metric_name.lower():
+                if is_win_rate_metric(metric_name):
                     plt.ylim(-5, 105)
                 plt.legend(loc="lower right", frameon=True, fontsize=11)
                 plt.grid(True, linestyle="--", alpha=0.6)
                 plt.tight_layout()
 
                 stem = f"{env_name}_{metric_name}"
-                save_path = versioned_path(out_dir, stem)
+                save_path = versioned_path(out_dir, stem, overwrite=overwrite)
                 plt.savefig(save_path, dpi=300)
                 print(f"    -> saved {save_path}")
             plt.close()
 
-    print("=" * 100)
+    print("=" * 110)
 
-    if filtered_out["env"] or filtered_out["alg"] or filtered_out["metric"]:
+    if any(filtered_out.values()):
         print(f"\n[i] Filtered out: {filtered_out['env']} run(s) by --envs, "
               f"{filtered_out['alg']} run(s) by --algs, "
+              f"{filtered_out['seed']} run(s) by --seeds, "
               f"{filtered_out['metric']} run(s) with no matching --metrics.")
 
     if skip_log:
@@ -429,7 +508,7 @@ def generate_plots(base_dir="results/sacred",
         if not reproduction_report:
             print("    No win-rate metrics matched the current filters — nothing to check.")
         for env_name, alg_name, metric_name, final_mean, thresh, verdict in reproduction_report:
-            print(f"    {env_name:<18} {alg_name:<8} {metric_name:<24} "
+            print(f"    {env_name:<38} {alg_name:<8} {metric_name:<24} "
                   f"{final_mean:6.2f}% vs {thresh:6.2f}%  -> {verdict}")
 
     print(f"\n[✓] Done. Plots are in '{out_dir}/'.")
@@ -453,7 +532,10 @@ def parse_args():
                     help="Only plot these algorithm names, e.g. LMAC QMIX (default: all found)")
     p.add_argument("--metrics", nargs="*", default=None,
                     help="Only plot these metric keys, e.g. test_battle_won_mean "
-                        "(default: test_battle_won_mean only)")
+                        "(default: auto — first available from test_battle_won_mean, "
+                        "test_score_reward_mean, test_return_mean per environment)")
+    p.add_argument("--seeds", nargs="*", default=None,
+                    help="Only include these seeds, e.g. --seeds 1 2 3 4 5 (default: all found)")
     p.add_argument("--smooth-weight", type=float, default=0.85,
                     help="EMA smoothing weight in [0,1). Higher = smoother. Default 0.85.")
     p.add_argument("--expected-seeds", nargs="*", default=None,
@@ -461,7 +543,7 @@ def parse_args():
                         "Used only to report missing seeds, not to filter data.")
     p.add_argument("--success-threshold", type=float, default=None,
                     help="If set, flags PASS/FAIL against this final win-rate percentage "
-                        "for every (env, alg) with a battle_won metric.")
+                        "for every (env, alg) with a win-rate metric.")
     p.add_argument("--final-window", type=int, default=10,
                     help="Number of trailing raw datapoints averaged for the 'final value' "
                         "reported in the summary table (default: 10).")
@@ -469,6 +551,8 @@ def parse_args():
                     help="Minimum number of seeds required for an (env, alg, metric) curve "
                         "to be plotted. Curves with fewer seeds are skipped and reported "
                         "instead of silently plotted as partial data. Default: 1 (no floor).")
+    p.add_argument("--overwrite", action="store_true",
+                    help="Overwrite <env>_<metric>.png instead of creating _v2, _v3, ...")
     return p.parse_args()
 
 
@@ -481,11 +565,13 @@ if __name__ == "__main__":
             envs_filter=args.envs,
             algs_filter=args.algs,
             metrics_filter=args.metrics,
+            seeds_filter=args.seeds,
             smooth_weight=args.smooth_weight,
             expected_seeds=args.expected_seeds,
             success_threshold=args.success_threshold,
             final_window=args.final_window,
             min_seeds=args.min_seeds,
+            overwrite=args.overwrite,
         )
     except Exception:
         print("[FATAL] Unhandled error while generating plots:", file=sys.stderr)

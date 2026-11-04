@@ -9,32 +9,51 @@
 #SBATCH --time=48:00:00
 #SBATCH --array=1-5
 #SBATCH --exclude=erc-hpc-comp040
-#SBATCH --output=/users/k25000843/lmac_project/logs/academy_run_pass_and_shoot_with_keeper/lmac/lmac_runpass_job%A_seed%a.log
+#SBATCH --output=logs/academy_run_pass_and_shoot_with_keeper/lmac/lmac_runpass_job%A_seed%a.log
 
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
 eval "$(conda shell.bash hook)"
-conda activate epymarl-llm
+conda activate epymarl_gfootball     # the env where gfootball was compiled
 cd ~/lmac_project
 
 SEED=$SLURM_ARRAY_TASK_ID
-
 ARCHIVE_DIR="src/llm_source_archive/academy_run_pass_and_shoot_with_keeper"
 
+echo "Node: $(hostname)  Env: $CONDA_PREFIX  Seed: $SEED"
+
+# ---- preflight (seconds): fail now instead of training on CPU / crashing later ----
+# torch is imported BEFORE gfootball, as main_llm_final.py does, so a library clash
+# between torch and the compiled engine shows up here.
+python - << 'PY' || { echo "ERROR: preflight failed on $(hostname); not starting training." >&2; exit 1; }
+import sys
+import torch
+if not torch.cuda.is_available():
+    sys.exit("CUDA is not available on this node (training would silently fall back to CPU)")
+import gfootball.env as football_env
+env = football_env.create_environment(
+    env_name="academy_run_pass_and_shoot_with_keeper",
+    representation="simple115", rewards="scoring", render=False,
+    number_of_left_players_agent_controls=2)
+env.reset(); env.step([0, 0]); env.close()
+print("preflight OK:", torch.__version__, torch.cuda.get_device_name(0))
+PY
+
+# ---- LMAC inputs ----
 if [ ! -f "$ARCHIVE_DIR/imp_state_select.py" ]; then
     echo "ERROR: $ARCHIVE_DIR/imp_state_select.py does not exist." >&2
     exit 1
 fi
 
+# Call the function instead of regex-scraping the file (that bug cost us the 8x8 first run).
 IMP_STATE=$(python -c "
 import sys
 sys.path.insert(0, '$ARCHIVE_DIR')
 from imp_state_select import select_important_state
 print(select_important_state())
 ")
-
 if [ -z "$IMP_STATE" ]; then
-    echo "ERROR: important_state extraction returned empty output for seed $SEED." >&2
+    echo "ERROR: important_state extraction returned empty output." >&2
     exit 1
 fi
 

@@ -6,7 +6,7 @@
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
 #SBATCH --array=1-5
-#SBATCH --output=lmac_1o_job%A_seed%a.log
+#SBATCH --output=logs/1o_10b_vs_1r/lmac/lmac_1o_job%A_seed%a.log
 
 eval "$(conda shell.bash hook)"
 conda activate epymarl-llm

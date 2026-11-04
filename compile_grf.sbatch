@@ -28,7 +28,7 @@
 
 eval "$(conda shell.bash hook)"
 conda activate epymarl_gfootball
-set -Eeo pipefail            # enabled AFTER activation (conda activate scripts dislike strict mode)
+set -Ee                      # enabled AFTER activation. No pipefail: 'cmd | head' SIGPIPEs (rc=141) killed job 38275969.
 trap 'rc=$?; echo "!!! FAILED rc=$rc line=$LINENO node=$(hostname) cmd: $BASH_COMMAND" >&2' ERR
 
 die()  { echo "ERROR: $*" >&2; exit 1; }
@@ -85,7 +85,16 @@ export CFLAGS="-O2 -fPIC -w -isystem $CONDA_PREFIX/include"
 # -include cstdint: old engine code relies on <cstdint> being pulled in transitively
 export CXXFLAGS="-O2 -fPIC -w -fpermissive -include cstdint -isystem $CONDA_PREFIX/include"
 # RPATH (not RUNPATH) baked in so Boost/SDL2/libstdc++ resolve from the env at runtime with NO LD_LIBRARY_PATH
-export LDFLAGS="-L$CONDA_PREFIX/lib -Wl,--disable-new-dtags -Wl,-rpath,$CONDA_PREFIX/lib"
+# Link-time: GCC 12's own libstdc++/libgcc_s must win over the env's GCC-15-era copies (job 38275274 failed with
+# "libstdc++.so: undefined reference to getentropy@GLIBC_2.25" because the env's libstdc++ needs a newer glibc
+# than the 2.17 sysroot). Run-time still uses the env's (newer) libstdc++ through the RPATH, which is compatible.
+GCC_RT=""
+for d in "$GRF_CC_ENV/x86_64-conda-linux-gnu/lib" "$GRF_CC_ENV/x86_64-conda-linux-gnu/lib64"; do
+  if [ -e "$d/libstdc++.so" ]; then GCC_RT="-L$d"; break; fi
+done
+echo "GCC runtime link dir: ${GCC_RT:-<none found, relying on --allow-shlib-undefined>}"
+# --allow-shlib-undefined: env libs reference glibc symbols newer than the 2.17 sysroot; the host glibc has them.
+export LDFLAGS="$GCC_RT -L$CONDA_PREFIX/lib -Wl,--allow-shlib-undefined -Wl,--disable-new-dtags -Wl,-rpath,$CONDA_PREFIX/lib"
 # NOTE: LD_LIBRARY_PATH is deliberately NOT exported (your first log only showed harmless
 # "no version information" warnings from curl and bash, but it is not needed with RPATH).
 
@@ -248,13 +257,22 @@ echo "Preflight OK."
 # ---------------------------------------------------------------- 7. build gfootball
 step "7. Build gfootball (no deps, so pip cannot move numpy/gym/torch)"
 python -c "import setuptools, wheel, psutil" 2>/dev/null || pip install --no-deps wheel psutil
-pip install --no-cache-dir --no-build-isolation --no-deps "gfootball==2.10.2"
+# Job 38275969 printed "Requirement already satisfied: gfootball" and skipped the build, so it inspected an OLD engine
+# (built earlier with GCC 15 + sysroot 2.39, needing GLIBC_2.38, with no RPATH). Remove it and force a real compile.
+pip uninstall -y gfootball || true
+SP0="$(python -c 'import site;print(site.getsitepackages()[0])')"
+rm -rf "$SP0/gfootball_engine" "$SP0/gfootball"
+BUILD_START=$(date +%s)
+pip install --no-cache-dir --no-build-isolation --no-deps --force-reinstall "gfootball==2.10.2"
 
 # ---------------------------------------------------------------- 8. runtime python deps
 step "8. Python deps (numpy kept < 2.0; opencv headless < 4.12 because 4.12+ requires numpy 2)"
 CONS="$(mktemp)"
 printf '%s\n' 'numpy>=1.22.4,<2' 'opencv-python-headless<4.12' > "$CONS"
 # numpy>=1.22.4 is what scipy 1.13 needs; the env currently has conda's numpy 1.19.5 from your first run.
+# Your env already has opencv-python 5.0.0.93 (needs numpy>=2). Both opencv packages write into the same cv2/ folder,
+# so remove all of them first, then install only the headless 4.10 build that works with numpy 1.x.
+pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python opencv-contrib-python-headless || true
 pip install --no-cache-dir -c "$CONS" "pygame>=1.9.6" "opencv-python-headless==4.10.0.84" scipy absl-py psutil \
   || pip install --no-cache-dir --ignore-installed numpy -c "$CONS" "pygame>=1.9.6" "opencv-python-headless==4.10.0.84" scipy absl-py psutil
 # gym: left alone if present. If absent, 0.26.2 is what pip itself chose in your first log.
@@ -268,14 +286,19 @@ SP="$(python -c 'import site;print(site.getsitepackages()[0])')"
 SO="$(find "$SP" -name '_gameplayfootball*.so' | head -n 1)"
 [ -n "$SO" ] || die "no _gameplayfootball*.so found under $SP"
 echo "engine: $SO"
+[ "$(stat -c %Y "$SO")" -ge "$BUILD_START" ] || die "engine .so is older than this job: pip did not rebuild it"
 
-echo "-- unresolved shared libraries (must be empty):"
-( ldd "$SO" | grep "not found" ) || echo "  none"
+echo "-- unresolved shared libraries / missing symbol versions (must be empty):"
+if ldd "$SO" 2>&1 | grep -q "not found"; then
+  ldd "$SO" 2>&1 | grep "not found"
+  die "engine has unresolved libraries or symbol versions (see above). If it is libGLU.so.1, tell me and I will add it."
+fi
+echo "  none"
 echo "-- libEGL / libGL / libstdc++ resolve to:"
 ldd "$SO" | grep -E "libEGL|libGL|libstdc\+\+" | sed 's/^/  /'
 
 NEED="$("$GRF_CC_ENV/bin/x86_64-conda-linux-gnu-objdump" -T "$SO" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1 | sed 's/GLIBC_//')"
-HAVE="$(ldd --version | head -1 | grep -o '[0-9]*\.[0-9]*$')"
+HAVE="$(getconf GNU_LIBC_VERSION | awk '{print $2}')"
 echo "-- highest GLIBC symbol needed: ${NEED:-none}   host glibc: $HAVE"
 if [ -n "$NEED" ] && [ "$(printf '%s\n%s\n' "$NEED" "$HAVE" | sort -V | tail -1)" != "$HAVE" ]; then
   die "engine needs GLIBC_$NEED but this node has $HAVE: the sysroot is wrong, rebuild the compiler env with sysroot_linux-64=2.17"

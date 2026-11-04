@@ -8,7 +8,7 @@
 #SBATCH --mem=32G
 #SBATCH --time=48:00:00
 #SBATCH --array=1-5
-#SBATCH --output=/users/k25000843/lmac_project/logs/2o_20b_vs_2r/qmix/qmix_2o_job%A_seed%a.log
+#SBATCH --output=logs/2o_20b_vs_2r/qmix/qmix_2o_job%A_seed%a.log
 
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 

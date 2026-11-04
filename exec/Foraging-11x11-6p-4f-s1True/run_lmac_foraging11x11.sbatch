@@ -9,7 +9,7 @@
 #SBATCH --time=24:00:00
 #SBATCH --array=1-5
 #SBATCH --exclude=erc-hpc-comp040
-#SBATCH --output=/users/k25000843/lmac_project/logs/Foraging-11x11-6p-4f-s1True/lmac/lmac_forage11x11_job%A_seed%a.log
+#SBATCH --output=logs/Foraging-11x11-6p-4f-s1True/lmac/lmac_forage11x11_job%A_seed%a.log
 
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 

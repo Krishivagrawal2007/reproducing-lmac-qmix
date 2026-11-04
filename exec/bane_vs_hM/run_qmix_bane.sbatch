@@ -6,7 +6,7 @@
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
 #SBATCH --array=1-5
-#SBATCH --output=qmix_bane_job%A_seed%a.log
+#SBATCH --output=logs/bane_vs_hM/qmix/qmix_bane_job%A_seed%a.log
 
 eval "$(conda shell.bash hook)"
 conda activate epymarl-llm
